@@ -13,6 +13,7 @@ const PROVIDERS = {
   printify: { id: 'printify', name: 'Printify', send: 'mockups' },
   // Teemill turns the front design into a buyable product page.
   teemill: { id: 'teemill', name: 'Teemill', send: 'product' },
+  fourthwall: { id: 'fourthwall', name: 'Fourthwall', send: 'mockups' },
 };
 
 export const PROVIDER =

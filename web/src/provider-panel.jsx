@@ -130,6 +130,7 @@ export function ProviderSend({ color, printArea, onExport }) {
           printful: 'Printful is rendering mockups. This takes 10–20 seconds…',
           printify: 'Printify is rendering mockups…',
           teemill: 'Teemill is creating the product…',
+          fourthwall: 'Fourthwall is rendering mockups…',
         }[PROVIDER.id]
       );
       setResult(await sendDesign(files, color.id));

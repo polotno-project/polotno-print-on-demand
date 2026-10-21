@@ -15,6 +15,9 @@
 //   GET  /teemill/print-area    the export size for Teemill's tee
 //   POST /teemill/product       turn the design into a buyable Teemill product
 //                               page with Teemill's Custom Product endpoint
+//   GET  /fourthwall/print-area real print areas of the demo tee
+//   POST /fourthwall/mockups    create a hidden design product in the shop,
+//                               return Fourthwall's mockups, then delete it
 //
 // Nothing is ordered. Mockups are free on Printful, and the Printify draft is
 // deleted as soon as its mockups are read.
@@ -24,6 +27,7 @@
 //   PRINTIFY_TOKEN, PRINTIFY_SHOP_ID
 //   LULU_CLIENT_KEY, LULU_CLIENT_SECRET, LULU_API (defaults to the sandbox)
 //   TEEMILL_PUBLIC_KEY
+//   FOURTHWALL_USERNAME, FOURTHWALL_PASSWORD (shop API credentials)
 //   PUBLIC_URL     this server's public URL; Printful downloads files from it
 //   ALLOWED_ORIGINS comma-separated, defaults to polotno.com and localhost
 
@@ -514,6 +518,101 @@ async function teemillProduct(body) {
   };
 }
 
+// --- Fourthwall ----------------------------------------------------------------
+
+const FW_API = 'https://api.fourthwall.com/open-api/v1.0';
+// Gildan Lightweight Fashion T-Shirt, DTG: Fourthwall renders its mockups.
+const FW_TEMPLATE = env.FOURTHWALL_TEMPLATE_ID || 'pro_5786d059adeb42899b';
+const FW_COLORS = { black: 'Black', blue: 'Royal Blue', red: 'Red' };
+// The demo's sides, mapped to the template's regions.
+const FW_REGIONS = { front: 'front_large', back: 'back' };
+
+const fourthwall = (path, opts = {}) => {
+  if (!env.FOURTHWALL_USERNAME || !env.FOURTHWALL_PASSWORD) {
+    throw new HttpError(503, 'FOURTHWALL_USERNAME and FOURTHWALL_PASSWORD are not set');
+  }
+  const basic = Buffer.from(`${env.FOURTHWALL_USERNAME}:${env.FOURTHWALL_PASSWORD}`).toString('base64');
+  return api(FW_API, basic, path, { ...opts, headers: { Authorization: `Basic ${basic}`, ...opts.headers } });
+};
+
+const fourthwallTemplate = cached(() => fourthwall(`/product-templates/${FW_TEMPLATE}`));
+
+async function fourthwallPrintArea() {
+  const template = await fourthwallTemplate('template');
+  const areas = {};
+  for (const [side, regionId] of Object.entries(FW_REGIONS)) {
+    const d = template.customizableAreas.find((a) => a.regionId === regionId)?.dimensions;
+    if (d) areas[side] = { width: d.pixelsWidth, height: d.pixelsHeight, dpi: d.dpi };
+  }
+  return { template: template.name, areas, request: `GET ${FW_API}/product-templates/${FW_TEMPLATE}` };
+}
+
+/** Width and height from a PNG's header. */
+const pngSize = (buf) => ({ width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) });
+
+async function fourthwallMockups(body) {
+  const sides = readSides(body);
+  const color = FW_COLORS[body.color] || 'Black';
+
+  const regions = [];
+  for (const [side, base64] of Object.entries(sides)) {
+    const png = Buffer.from(base64, 'base64');
+    const upload = await fourthwall('/media/upload-url', {
+      method: 'POST',
+      body: { fileName: `polotno-demo-${side}.png`, contentType: 'image/png', size: png.length },
+    });
+    const put = await fetch(upload.uploadUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'image/png', 'x-goog-content-length-range': `0,${png.length}` },
+      body: png,
+    });
+    if (!put.ok) throw new HttpError(502, `Fourthwall upload failed (${put.status})`);
+    const image = await fourthwall('/media/images', {
+      method: 'POST',
+      body: { fileUrl: upload.fileUrl, ...pngSize(png) },
+    });
+    regions.push({ region: FW_REGIONS[side], imageId: image.id, placementStrategy: 'FULL_REGION' });
+  }
+
+  const productBody = {
+    type: 'design',
+    productTemplateId: FW_TEMPLATE,
+    name: 'Polotno demo tee',
+    description: 'Created by the Polotno SDK demo and deleted right after.',
+    colors: [color],
+    regions,
+    publishOnCreate: false,
+  };
+  const product = await fourthwall('/products', { method: 'POST', body: productBody });
+
+  try {
+    const wanted = regions.map((r) => (r.region === 'front_large' ? 'front' : r.region));
+    const mockups = (product.images || [])
+      .filter((img) => img.color === color && wanted.includes(img.region))
+      .map((img) => ({ side: `${img.region}, ${color}`, url: img.url }));
+    return {
+      mockups,
+      requests: [
+        {
+          title: 'Upload each side, then register it as an image',
+          endpoint: `POST ${FW_API}/media/upload-url → PUT → POST ${FW_API}/media/images`,
+          body: { fileName: 'polotno-demo-front.png', contentType: 'image/png', size: '<bytes>' },
+        },
+        {
+          title: 'Create the design product (hidden)',
+          endpoint: `POST ${FW_API}/products`,
+          body: productBody,
+        },
+      ],
+    };
+  } finally {
+    // The demo only needs the mockups; keep the shop clean.
+    fourthwall(`/products/${product.productId}`, { method: 'DELETE' }).catch((e) =>
+      console.error('fourthwall cleanup failed', e.message)
+    );
+  }
+}
+
 // --- rate limit -----------------------------------------------------------------
 
 const hits = new Map();
@@ -536,6 +635,8 @@ const routes = {
   'POST /lulu/check-cover': (body) => luluCheckCover(body),
   'GET /teemill/print-area': () => teemillPrintArea(),
   'POST /teemill/product': (body) => teemillProduct(body),
+  'GET /fourthwall/print-area': () => fourthwallPrintArea(),
+  'POST /fourthwall/mockups': (body) => fourthwallMockups(body),
 };
 
 function readBody(req) {
