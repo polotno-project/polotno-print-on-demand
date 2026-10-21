@@ -1,0 +1,156 @@
+import React from 'react';
+import {
+  Button,
+  Spinner,
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from 'polotno/primitives';
+
+import { PROVIDER, sendDesign } from './provider';
+
+// The print step in print-on-demand mode: export the artwork, send it to the
+// provider through the demo backend, and show what came back.
+
+const mono = 'ui-monospace, SFMono-Regular, Menlo, monospace';
+
+const styles = {
+  hint: { fontSize: 13, color: '#525252', marginTop: 8 },
+  progress: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    fontSize: 13,
+    marginTop: 10,
+    padding: '10px 12px',
+    background: '#f4f4f4',
+  },
+  button: { width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 },
+  error: { fontSize: 13, color: '#b42318', marginTop: 8 },
+  dialog: {
+    maxWidth: 820,
+    width: 'calc(100vw - 32px)',
+    maxHeight: 'calc(100vh - 48px)',
+    overflowY: 'auto',
+  },
+  mockups: { display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 4 },
+  mockup: {
+    width: 220,
+    height: 220,
+    objectFit: 'contain',
+    background: '#f4f4f4',
+    border: '1px solid #e0e0e0',
+  },
+  caption: { fontSize: 12, color: '#525252', marginTop: 4, textTransform: 'capitalize' },
+  label: { fontSize: 13, fontWeight: 600, marginTop: 20 },
+  endpoint: { fontFamily: mono, fontSize: 12, margin: '6px 0' },
+  code: {
+    fontFamily: mono,
+    fontSize: 12,
+    lineHeight: 1.5,
+    margin: 0,
+    padding: 12,
+    background: '#f4f4f4',
+    overflowX: 'auto',
+    whiteSpace: 'pre',
+    maxHeight: 280,
+  },
+};
+
+// Data URLs are megabytes long; show what they are instead of the bytes.
+const shorten = (value) =>
+  JSON.stringify(
+    value,
+    (key, v) => (typeof v === 'string' && v.length > 120 ? `${v.slice(0, 40)}…` : v),
+    2
+  );
+
+const Result = ({ result, onClose }) => (
+  <Dialog open onOpenChange={(open) => !open && onClose()}>
+    <DialogContent style={styles.dialog}>
+      <DialogHeader>
+        <DialogTitle>Back from {PROVIDER.name}</DialogTitle>
+        <DialogDescription>
+          These mockups were rendered by {PROVIDER.name} from the print files this
+          editor just exported, through its API. Nothing was ordered.
+        </DialogDescription>
+      </DialogHeader>
+
+      <div style={styles.mockups}>
+        {result.mockups.map((m) => (
+          <div key={m.url}>
+            <img src={m.url} alt={`${PROVIDER.name} mockup, ${m.side}`} style={styles.mockup} />
+            <div style={styles.caption}>{m.side}</div>
+          </div>
+        ))}
+      </div>
+
+      {result.requests.map((r) => (
+        <div key={r.endpoint}>
+          <div style={styles.label}>{r.title}</div>
+          <p style={styles.endpoint}>{r.endpoint}</p>
+          <pre style={styles.code}>{shorten(r.body)}</pre>
+        </div>
+      ))}
+    </DialogContent>
+  </Dialog>
+);
+
+export function ProviderSend({ color, printArea, onExport }) {
+  // null when idle, otherwise the step in progress, shown under the button.
+  const [step, setStep] = React.useState(null);
+  const busy = step !== null;
+  const [error, setError] = React.useState(null);
+  const [result, setResult] = React.useState(null);
+
+  const send = async () => {
+    setStep('Exporting the print files…');
+    setError(null);
+    try {
+      const files = await onExport(printArea.areas);
+      // Printful's mockup generator is a queue; Printify answers in seconds.
+      setStep(
+        PROVIDER.id === 'printful'
+          ? 'Printful is rendering mockups. This takes 10–20 seconds…'
+          : 'Printify is rendering mockups…'
+      );
+      setResult(await sendDesign(files, color.id));
+    } catch (e) {
+      console.error(`${PROVIDER.id} send failed`, e);
+      setError(e?.message || 'Something went wrong');
+    } finally {
+      setStep(null);
+    }
+  };
+
+  return (
+    <>
+      <Button
+        variant="outline"
+        size="lg"
+        disabled={!printArea}
+        aria-busy={busy}
+        onClick={busy ? undefined : send}
+        style={{ ...styles.button, cursor: busy ? 'progress' : undefined }}
+      >
+        {busy ? `Sending to ${PROVIDER.name}…` : `Send to ${PROVIDER.name}`}
+      </Button>
+      {busy ? (
+        <div role="status" style={styles.progress}>
+          <Spinner />
+          {step}
+        </div>
+      ) : error ? (
+        <div style={styles.error}>{error}</div>
+      ) : (
+        <div style={styles.hint}>
+          Exports the artwork at {PROVIDER.name}&apos;s print size and gets {PROVIDER.name}
+          &apos;s own mockups back. Nothing is ordered.
+        </div>
+      )}
+      {result && <Result result={result} onClose={() => setResult(null)} />}
+    </>
+  );
+}

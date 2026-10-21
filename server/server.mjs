@@ -1,0 +1,457 @@
+// A small backend for the Polotno print-on-demand demos.
+//
+// The demos run in the browser, so they cannot hold a Printful or Printify API
+// token. This server holds both and exposes four routes the demos call:
+//
+//   GET  /printful/print-area   real print file size for the demo tee
+//   POST /printful/mockups      render the customer's design with Printful's
+//                               mockup generator
+//   GET  /printify/print-area   real print area for the demo tee
+//   POST /printify/mockups      upload the design, create a draft product in
+//                               the test shop, return Printify's mockups, then
+//                               delete the draft
+//
+// Nothing is ordered. Mockups are free on Printful, and the Printify draft is
+// deleted as soon as its mockups are read.
+//
+// Env:
+//   PRINTFUL_TOKEN, PRINTFUL_STORE_ID (needed for account-level tokens)
+//   PRINTIFY_TOKEN, PRINTIFY_SHOP_ID
+//   PUBLIC_URL     this server's public URL; Printful downloads files from it
+//   ALLOWED_ORIGINS comma-separated, defaults to polotno.com and localhost
+
+import http from 'node:http';
+import { randomUUID } from 'node:crypto';
+
+const env = process.env;
+const PORT = Number(env.PORT || 8787);
+const PUBLIC_URL = (env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
+const ALLOWED_ORIGINS = (
+  env.ALLOWED_ORIGINS ||
+  'https://polotno.com,https://www.polotno.com,http://localhost:3000,http://localhost:5173'
+).split(',');
+
+// The demo sells one tee: Bella+Canvas 3001 on both platforms. Colours map to
+// the names each catalog uses. Overridable per env if a catalog changes.
+const PRINTFUL_PRODUCT_ID = Number(env.PRINTFUL_PRODUCT_ID || 71);
+const PRINTIFY_BLUEPRINT_ID = Number(env.PRINTIFY_BLUEPRINT_ID || 12);
+const PRINTIFY_PROVIDER_ID = env.PRINTIFY_PROVIDER_ID
+  ? Number(env.PRINTIFY_PROVIDER_ID)
+  : null;
+const SIZE = env.DEMO_SIZE || 'M';
+const COLORS = { black: 'Black', blue: 'True Royal', red: 'Red' };
+const SIDES = ['front', 'back'];
+
+const MAX_BODY = 25 * 1024 * 1024;
+const FILE_TTL_MS = 10 * 60 * 1000;
+
+// --- helpers ------------------------------------------------------------------
+
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function cached(fn, ttlMs = 60 * 60 * 1000) {
+  const cache = new Map();
+  return async (key) => {
+    const hit = cache.get(key);
+    if (hit && hit.expires > Date.now()) return hit.value;
+    const value = await fn(key);
+    cache.set(key, { value, expires: Date.now() + ttlMs });
+    return value;
+  };
+}
+
+async function api(base, token, path, { method = 'GET', body, headers = {} } = {}) {
+  const res = await fetch(base + path, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      ...headers,
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let json;
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {
+    json = { raw: text };
+  }
+  if (!res.ok) {
+    const detail = json?.error?.message || json?.message || json?.result || text;
+    throw new HttpError(502, `${method} ${path} failed (${res.status}): ${detail}`);
+  }
+  return json;
+}
+
+const printful = (path, opts = {}) => {
+  if (!env.PRINTFUL_TOKEN) throw new HttpError(503, 'PRINTFUL_TOKEN is not set');
+  const headers = env.PRINTFUL_STORE_ID ? { 'X-PF-Store-Id': env.PRINTFUL_STORE_ID } : {};
+  return api('https://api.printful.com', env.PRINTFUL_TOKEN, path, {
+    ...opts,
+    headers: { ...headers, ...opts.headers },
+  });
+};
+
+const printify = (path, opts) => {
+  if (!env.PRINTIFY_TOKEN) throw new HttpError(503, 'PRINTIFY_TOKEN is not set');
+  return api('https://api.printify.com/v1', env.PRINTIFY_TOKEN, path, opts);
+};
+
+const colorName = (id) => {
+  const name = COLORS[id];
+  if (!name) throw new HttpError(400, `Unknown color "${id}"`);
+  return name;
+};
+
+// The demo posts base64 PNGs per side. Keep only real, non-empty PNG data.
+function readSides(body) {
+  const sides = {};
+  for (const side of SIDES) {
+    const value = body?.files?.[side];
+    if (!value) continue;
+    const base64 = String(value).replace(/^data:image\/png;base64,/, '');
+    if (!base64.startsWith('iVBOR')) throw new HttpError(400, `${side} is not a PNG`);
+    sides[side] = base64;
+  }
+  if (!Object.keys(sides).length) throw new HttpError(400, 'No design to send');
+  return sides;
+}
+
+// --- temporary file hosting (Printful downloads print files by URL) -----------
+
+const files = new Map();
+
+function hostFile(base64) {
+  const id = randomUUID();
+  files.set(id, { data: Buffer.from(base64, 'base64'), expires: Date.now() + FILE_TTL_MS });
+  return `${PUBLIC_URL}/files/${id}.png`;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, f] of files) if (f.expires < now) files.delete(id);
+}, 60 * 1000).unref();
+
+// --- Printful -------------------------------------------------------------------
+
+const printfulCatalog = cached(async () => {
+  const [{ result: product }, { result: printfiles }] = await Promise.all([
+    printful(`/products/${PRINTFUL_PRODUCT_ID}`),
+    printful(`/mockup-generator/printfiles/${PRINTFUL_PRODUCT_ID}`),
+  ]);
+  return { product, printfiles };
+});
+
+async function printfulVariant(colorId) {
+  const { product, printfiles } = await printfulCatalog('catalog');
+  const color = colorName(colorId);
+  const variant = product.variants.find((v) => v.color === color && v.size === SIZE);
+  if (!variant) throw new HttpError(502, `Printful has no ${color} / ${SIZE} variant`);
+  const mapping = printfiles.variant_printfiles.find((v) => v.variant_id === variant.id);
+  const areas = {};
+  for (const side of SIDES) {
+    const id = mapping?.placements?.[side];
+    const file = printfiles.printfiles.find((p) => p.printfile_id === id);
+    if (file) areas[side] = { width: file.width, height: file.height, dpi: file.dpi };
+  }
+  return { variant, areas };
+}
+
+async function printfulPrintArea(query) {
+  const { variant, areas } = await printfulVariant(query.get('color') || 'black');
+  return {
+    product: `${PRINTFUL_PRODUCT_ID}`,
+    variant: { id: variant.id, name: variant.name },
+    areas,
+    request: `GET https://api.printful.com/mockup-generator/printfiles/${PRINTFUL_PRODUCT_ID}`,
+  };
+}
+
+async function printfulMockups(body) {
+  const sides = readSides(body);
+  const { variant, areas } = await printfulVariant(body.color || 'black');
+  const taskBody = {
+    variant_ids: [variant.id],
+    format: 'jpg',
+    // A flat shot, one on a model and one lifestyle, only for designed sides.
+    options: Object.keys(sides).map((side) => (side === 'back' ? 'Back' : 'Front')),
+    option_groups: ['Flat', "Men's", "Women's Lifestyle"],
+    files: Object.entries(sides).map(([side, base64]) => ({
+      placement: side,
+      image_url: hostFile(base64),
+      position: {
+        area_width: areas[side].width,
+        area_height: areas[side].height,
+        width: areas[side].width,
+        height: areas[side].height,
+        top: 0,
+        left: 0,
+      },
+    })),
+  };
+  const { result: task } = await printful(
+    `/mockup-generator/create-task/${PRINTFUL_PRODUCT_ID}`,
+    { method: 'POST', body: taskBody }
+  );
+
+  // The generator is asynchronous: poll until the mockups are ready.
+  const started = Date.now();
+  let status = task;
+  while (status.status === 'pending' && Date.now() - started < 60 * 1000) {
+    await sleep(2000);
+    ({ result: status } = await printful(
+      `/mockup-generator/task?task_key=${encodeURIComponent(task.task_key)}`
+    ));
+  }
+  if (status.status !== 'completed') {
+    throw new HttpError(502, `Printful mockup task ${status.status}: ${status.error || ''}`);
+  }
+
+  return {
+    variant: { id: variant.id, name: variant.name },
+    // The main render per side, plus the model and lifestyle shots.
+    mockups: status.mockups
+      .flatMap((m) => [
+        { side: m.placement, url: m.mockup_url },
+        ...(m.extra || []).map((x) => ({ side: x.title || x.option, url: x.url })),
+      ])
+      .slice(0, 4),
+    requests: [
+      {
+        title: 'Render mockups of the design',
+        endpoint: `POST https://api.printful.com/mockup-generator/create-task/${PRINTFUL_PRODUCT_ID}`,
+        body: taskBody,
+      },
+      {
+        title: 'Then order it: same files, same placements',
+        endpoint: 'POST https://api.printful.com/orders',
+        body: {
+          recipient: { name: '…', address1: '…', city: '…', country_code: '…', zip: '…' },
+          items: [
+            {
+              variant_id: variant.id,
+              quantity: 1,
+              files: taskBody.files.map(({ placement, image_url, position }) => ({
+                type: placement,
+                url: image_url,
+                position,
+              })),
+            },
+          ],
+        },
+      },
+    ],
+  };
+}
+
+// --- Printify -------------------------------------------------------------------
+
+const printifyCatalog = cached(async () => {
+  let providerId = PRINTIFY_PROVIDER_ID;
+  if (!providerId) {
+    const providers = await printify(
+      `/catalog/blueprints/${PRINTIFY_BLUEPRINT_ID}/print_providers.json`
+    );
+    providerId = providers[0]?.id;
+  }
+  const { variants } = await printify(
+    `/catalog/blueprints/${PRINTIFY_BLUEPRINT_ID}/print_providers/${providerId}/variants.json`
+  );
+  return { providerId, variants };
+});
+
+async function printifyVariant(colorId) {
+  const { providerId, variants } = await printifyCatalog('catalog');
+  const color = colorName(colorId);
+  const variant = variants.find(
+    (v) => v.options?.color === color && v.options?.size === SIZE
+  );
+  if (!variant) throw new HttpError(502, `Printify has no ${color} / ${SIZE} variant`);
+  const areas = {};
+  for (const p of variant.placeholders || []) {
+    if (SIDES.includes(p.position)) areas[p.position] = { width: p.width, height: p.height };
+  }
+  return { providerId, variant, areas };
+}
+
+async function printifyPrintArea(query) {
+  const { providerId, variant, areas } = await printifyVariant(query.get('color') || 'black');
+  return {
+    blueprint: PRINTIFY_BLUEPRINT_ID,
+    provider: providerId,
+    variant: { id: variant.id, name: variant.title },
+    areas,
+    request: `GET https://api.printify.com/v1/catalog/blueprints/${PRINTIFY_BLUEPRINT_ID}/print_providers/${providerId}/variants.json`,
+  };
+}
+
+// The test shop: PRINTIFY_SHOP_ID, or the account's first shop.
+const printifyShop = cached(async () => {
+  if (env.PRINTIFY_SHOP_ID) return env.PRINTIFY_SHOP_ID;
+  const shops = await printify('/shops.json');
+  if (!shops[0]) throw new HttpError(503, 'The Printify account has no shop');
+  return shops[0].id;
+});
+
+async function printifyMockups(body) {
+  const shop = await printifyShop('shop');
+  const sides = readSides(body);
+  const { providerId, variant } = await printifyVariant(body.color || 'black');
+
+  const uploads = {};
+  for (const [side, base64] of Object.entries(sides)) {
+    uploads[side] = await printify('/uploads/images.json', {
+      method: 'POST',
+      body: { file_name: `polotno-demo-${side}.png`, contents: base64 },
+    });
+  }
+
+  const productBody = {
+    title: 'Polotno demo tee (draft)',
+    description: 'Created by the Polotno SDK demo and deleted right after.',
+    blueprint_id: PRINTIFY_BLUEPRINT_ID,
+    print_provider_id: providerId,
+    variants: [{ id: variant.id, price: 2499, is_enabled: true }],
+    print_areas: [
+      {
+        variant_ids: [variant.id],
+        placeholders: Object.entries(uploads).map(([side, upload]) => ({
+          position: side,
+          images: [{ id: upload.id, x: 0.5, y: 0.5, scale: 1, angle: 0 }],
+        })),
+      },
+    ],
+  };
+  const product = await printify(`/shops/${shop}/products.json`, {
+    method: 'POST',
+    body: productBody,
+  });
+
+  try {
+    // Printify renders dozens of shots per product. Keep the flat front and
+    // back (when there is a back design), one on a model and one lifestyle.
+    const wanted = ['front', ...(sides.back ? ['back'] : []), 'person-1', 'lifestyle'];
+    const labelOf = (src) => new URL(src).searchParams.get('camera_label');
+    const images = wanted
+      .map((label) =>
+        (product.images || []).find(
+          (img) => img.variant_ids?.includes(variant.id) && labelOf(img.src) === label
+        )
+      )
+      .filter(Boolean)
+      .map((img) => ({ side: labelOf(img.src).replace('person-1', 'on a model'), url: img.src }));
+    return {
+      variant: { id: variant.id, name: variant.title },
+      mockups: images,
+      requests: [
+        {
+          title: 'Upload the artwork (one per side)',
+          endpoint: 'POST https://api.printify.com/v1/uploads/images.json',
+          body: { file_name: 'design-front.png', contents: '<base64 PNG>' },
+        },
+        {
+          title: 'Create the product with it on the print areas',
+          endpoint: `POST https://api.printify.com/v1/shops/{shop_id}/products.json`,
+          body: productBody,
+        },
+      ],
+    };
+  } finally {
+    // The demo only needs the mockups; leave the test shop clean.
+    printify(`/shops/${shop}/products/${product.id}.json`, { method: 'DELETE' }).catch(
+      (e) => console.error('printify cleanup failed', e.message)
+    );
+  }
+}
+
+// --- rate limit -----------------------------------------------------------------
+
+const hits = new Map();
+function rateLimit(ip, limit = 12, windowMs = 60 * 1000) {
+  const now = Date.now();
+  const recent = (hits.get(ip) || []).filter((t) => now - t < windowMs);
+  if (recent.length >= limit) throw new HttpError(429, 'Too many requests, try again in a minute');
+  recent.push(now);
+  hits.set(ip, recent);
+}
+
+// --- server ---------------------------------------------------------------------
+
+const routes = {
+  'GET /health': async () => ({ ok: true }),
+  'GET /printful/print-area': (_, q) => printfulPrintArea(q),
+  'POST /printful/mockups': (body) => printfulMockups(body),
+  'GET /printify/print-area': (_, q) => printifyPrintArea(q),
+  'POST /printify/mockups': (body) => printifyMockups(body),
+};
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > MAX_BODY) {
+        reject(new HttpError(413, 'Design too large'));
+        req.destroy();
+      } else chunks.push(c);
+    });
+    req.on('end', () => {
+      try {
+        resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {});
+      } catch {
+        reject(new HttpError(400, 'Body is not JSON'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, PUBLIC_URL);
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  }
+  if (req.method === 'OPTIONS') return res.writeHead(204).end();
+
+  const file = url.pathname.match(/^\/files\/([0-9a-f-]+)\.png$/);
+  if (req.method === 'GET' && file) {
+    const f = files.get(file[1]);
+    if (!f) return res.writeHead(404).end();
+    return res.writeHead(200, { 'Content-Type': 'image/png' }).end(f.data);
+  }
+
+  const route = routes[`${req.method} ${url.pathname}`];
+  try {
+    if (!route) throw new HttpError(404, 'Not found');
+    if (req.method === 'POST') {
+      const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '')
+        .split(',')[0]
+        .trim();
+      rateLimit(ip);
+    }
+    const body = req.method === 'POST' ? await readBody(req) : null;
+    const result = await route(body, url.searchParams);
+    res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(result));
+  } catch (e) {
+    const status = e.status || 500;
+    if (status >= 500) console.error(req.method, url.pathname, e.message);
+    res
+      .writeHead(status, { 'Content-Type': 'application/json' })
+      .end(JSON.stringify({ error: e.message }));
+  }
+});
+
+server.listen(PORT, () => console.log(`pod-proxy listening on ${PORT}`));

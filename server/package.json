@@ -1,0 +1,9 @@
+{
+  "name": "polotno-print-on-demand-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Backend for the Polotno print-on-demand demos: holds the Printful and Printify tokens and returns real print areas and mockups",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": { "start": "node server.mjs" }
+}
