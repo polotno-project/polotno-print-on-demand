@@ -2,6 +2,8 @@
 
 A t-shirt customizer built with [Polotno SDK](https://polotno.com). Customers design the front and back of a shirt in the browser. The app exports print files at the size Printful or Printify asks for, sends them to that provider's API, and shows the mockups the provider renders. With Teemill, it turns the design into a real product page.
 
+> **You need a Polotno API key to run this.** The code in this repo is MIT, but it runs on [Polotno SDK](https://polotno.com), which is commercial. Get a trial key in your [Polotno dashboard](https://polotno.com/cabinet) to try it (trial keys show a "Powered by Polotno" credit); shipping it in a product needs a [paid Polotno license](https://polotno.com/sdk/pricing).
+
 Try it live: [with Printful](https://polotno.com/sdk/product/integrations/printful) · [with Printify](https://polotno.com/sdk/product/integrations/printify) · [with Teemill](https://polotno.com/sdk/product/integrations/teemill) · [with Fourthwall](https://polotno.com/sdk/product/integrations/fourthwall)
 
 ## How it works
@@ -13,7 +15,7 @@ Try it live: [with Printful](https://polotno.com/sdk/product/integrations/printf
 
 ## Run it
 
-You need Node 20+, pnpm, a Polotno API key (free for development at [polotno.com/cabinet](https://polotno.com/cabinet)) and a token for Printful, Printify or both.
+You need Node 20+, pnpm, a Polotno API key (a trial key from [polotno.com/cabinet](https://polotno.com/cabinet) works for trying it) and a token for at least one provider.
 
 ```bash
 cd server
@@ -40,4 +42,4 @@ The tokens stay on the server. Printful downloads print files from a public URL,
 
 ## License
 
-MIT
+The code in this repository is MIT. Polotno SDK itself is not: it needs a Polotno API key, and production use needs a [paid license](https://polotno.com/sdk/pricing).

@@ -33,7 +33,8 @@ import { ConfigPanel } from './config-panel';
 // column on the right. The shirt photo, the print-window overlay, and the
 // print-area guide are locked layers on a single page (see scene.js); the
 // customer's artwork sits between them, clipped to the printable area.
-// Free for development: get a key at https://polotno.com/cabinet
+// Polotno SDK needs an API key: a trial key from https://polotno.com/cabinet
+// works for trying this; production use needs a paid license.
 const POLOTNO_KEY = import.meta.env.VITE_POLOTNO_KEY;
 
 const store = createStore({ key: POLOTNO_KEY, showCredit: false });
