@@ -10,6 +10,11 @@
 //   POST /printify/mockups      upload the design, create a draft product in
 //                               the test shop, return Printify's mockups, then
 //                               delete the draft
+//   POST /lulu/check-cover      ask Lulu for the cover size it expects and
+//                               validate the exported cover PDF against it
+//   GET  /teemill/print-area    the export size for Teemill's tee
+//   POST /teemill/product       turn the design into a buyable Teemill product
+//                               page with Teemill's Custom Product endpoint
 //
 // Nothing is ordered. Mockups are free on Printful, and the Printify draft is
 // deleted as soon as its mockups are read.
@@ -17,6 +22,8 @@
 // Env:
 //   PRINTFUL_TOKEN, PRINTFUL_STORE_ID (needed for account-level tokens)
 //   PRINTIFY_TOKEN, PRINTIFY_SHOP_ID
+//   LULU_CLIENT_KEY, LULU_CLIENT_SECRET, LULU_API (defaults to the sandbox)
+//   TEEMILL_PUBLIC_KEY
 //   PUBLIC_URL     this server's public URL; Printful downloads files from it
 //   ALLOWED_ORIGINS comma-separated, defaults to polotno.com and localhost
 
@@ -129,10 +136,12 @@ function readSides(body) {
 
 const files = new Map();
 
-function hostFile(base64) {
+const FILE_TYPES = { png: 'image/png', pdf: 'application/pdf' };
+
+function hostFile(base64, ext = 'png') {
   const id = randomUUID();
-  files.set(id, { data: Buffer.from(base64, 'base64'), expires: Date.now() + FILE_TTL_MS });
-  return `${PUBLIC_URL}/files/${id}.png`;
+  files.set(id, { data: Buffer.from(base64, 'base64'), ext, expires: Date.now() + FILE_TTL_MS });
+  return `${PUBLIC_URL}/files/${id}.${ext}`;
 }
 
 setInterval(() => {
@@ -372,6 +381,139 @@ async function printifyMockups(body) {
   }
 }
 
+// --- Lulu -----------------------------------------------------------------------
+
+const LULU_API = (env.LULU_API || 'https://api.sandbox.lulu.com').replace(/\/$/, '');
+
+// Client-credentials token, reused until shortly before it expires.
+let luluToken = null;
+async function luluAuth() {
+  if (!env.LULU_CLIENT_KEY || !env.LULU_CLIENT_SECRET) {
+    throw new HttpError(503, 'LULU_CLIENT_KEY and LULU_CLIENT_SECRET are not set');
+  }
+  if (luluToken && luluToken.expires > Date.now()) return luluToken.value;
+  const basic = Buffer.from(`${env.LULU_CLIENT_KEY}:${env.LULU_CLIENT_SECRET}`).toString('base64');
+  const res = await fetch(`${LULU_API}/auth/realms/glasstree/protocol/openid-connect/token`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${basic}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: 'grant_type=client_credentials',
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new HttpError(502, `Lulu auth failed (${res.status})`);
+  luluToken = { value: json.access_token, expires: Date.now() + (json.expires_in - 60) * 1000 };
+  return luluToken.value;
+}
+
+const lulu = async (path, opts) => api(LULU_API, await luluAuth(), path, opts);
+
+// Paperback pod_package_id: trim + color + quality + binding + paper + finish.
+const LULU_PAPERS = {
+  'bw-white': 'BW.STD.PB.060UW444.MXX',
+  'bw-cream': 'BW.STD.PB.060UC444.MXX',
+  color: 'FC.STD.PB.080CW444.MXX',
+};
+function luluPackage(trimWidth, trimHeight, paper) {
+  const code = LULU_PAPERS[paper];
+  if (!code) throw new HttpError(400, `Unknown paper "${paper}"`);
+  const dim = (inches) => String(Math.round(inches * 100)).padStart(4, '0');
+  return `${dim(trimWidth)}X${dim(trimHeight)}.${code}`;
+}
+
+async function luluCheckCover(body) {
+  // Polotno's PDF data URL carries a filename parameter before base64.
+  const pdf = String(body?.pdf || '').replace(/^data:application\/pdf[^,]*,/, '');
+  if (!pdf.startsWith('JVBER')) throw new HttpError(400, 'pdf is not a PDF');
+  const pageCount = Math.round(Number(body.pageCount));
+  if (!(pageCount > 0)) throw new HttpError(400, 'pageCount is required');
+  const pod_package_id = luluPackage(Number(body.trimWidth), Number(body.trimHeight), body.paper || 'bw-white');
+
+  const dimensionsBody = { pod_package_id, interior_page_count: pageCount, unit: 'inch' };
+  const expected = await lulu('/cover-dimensions/', { method: 'POST', body: dimensionsBody });
+
+  const validateBody = { source_url: hostFile(pdf, 'pdf'), pod_package_id, interior_page_count: pageCount };
+  let check = await lulu('/validate-cover/', { method: 'POST', body: validateBody });
+
+  // Lulu normalizes the file asynchronously: the create response has no
+  // status yet, then NORMALIZING, then NORMALIZED or ERROR. Poll until it
+  // settles.
+  const started = Date.now();
+  const pending = (c) => !c.status || c.status === 'NORMALIZING';
+  while (pending(check) && Date.now() - started < 90 * 1000) {
+    await sleep(3000);
+    check = await lulu(`/validate-cover/${check.id}/`);
+  }
+
+  return {
+    pod_package_id,
+    expected,
+    validation: { status: check.status, errors: check.errors || [] },
+    requests: [
+      {
+        title: 'Ask Lulu for the cover size',
+        endpoint: `POST ${LULU_API}/cover-dimensions/`,
+        body: dimensionsBody,
+        response: expected,
+      },
+      {
+        title: 'Validate the cover PDF',
+        endpoint: `POST ${LULU_API}/validate-cover/`,
+        body: validateBody,
+        response: { status: check.status, errors: check.errors || [] },
+      },
+    ],
+  };
+}
+
+// --- Teemill --------------------------------------------------------------------
+
+// Teemill's Custom Product endpoint takes one image and returns a product
+// page on your Teemill store. Men's Basic T-shirt, in the demo's colours.
+const TEEMILL_ITEM = 'RNA1';
+const TEEMILL_COLORS = { black: 'Black', blue: 'Bright Blue', red: 'Red' };
+
+// Teemill doesn't publish a print file size for this endpoint; it scales the
+// image to the print area. Export large enough to print sharp.
+const teemillPrintArea = async () => ({
+  areas: { front: { width: 3510, height: 3740 } },
+  fromCatalog: false,
+  request: 'POST https://teemill.com/omnis/v3/product/create',
+});
+
+async function teemillProduct(body) {
+  if (!env.TEEMILL_PUBLIC_KEY) throw new HttpError(503, 'TEEMILL_PUBLIC_KEY is not set');
+  const sides = readSides(body);
+  if (!sides.front) throw new HttpError(400, 'Teemill takes the front design; add some artwork to the front');
+  const colours = TEEMILL_COLORS[body.color] || 'Black';
+  const productBody = {
+    image_url: `data:image/png;base64,${sides.front}`,
+    item_code: TEEMILL_ITEM,
+    colours,
+    name: 'Polotno demo tee',
+    price: 20.0,
+  };
+  const res = await fetch('https://teemill.com/omnis/v3/product/create', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${env.TEEMILL_PUBLIC_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(productBody),
+  });
+  const product = await res.json().catch(() => ({}));
+  if (!res.ok || !product.url) throw new HttpError(502, `Teemill product create failed (${res.status})`);
+  return {
+    productUrl: product.url,
+    mockups: [{ side: `front, ${colours}`, url: product.colours?.[colours] || product.image }],
+    requests: [
+      {
+        title: 'Create the product from the design',
+        endpoint: 'POST https://teemill.com/omnis/v3/product/create',
+        body: { ...productBody, image_url: '<base64 PNG>' },
+      },
+    ],
+  };
+}
+
 // --- rate limit -----------------------------------------------------------------
 
 const hits = new Map();
@@ -391,6 +533,9 @@ const routes = {
   'POST /printful/mockups': (body) => printfulMockups(body),
   'GET /printify/print-area': (_, q) => printifyPrintArea(q),
   'POST /printify/mockups': (body) => printifyMockups(body),
+  'POST /lulu/check-cover': (body) => luluCheckCover(body),
+  'GET /teemill/print-area': () => teemillPrintArea(),
+  'POST /teemill/product': (body) => teemillProduct(body),
 };
 
 function readBody(req) {
@@ -426,11 +571,11 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === 'OPTIONS') return res.writeHead(204).end();
 
-  const file = url.pathname.match(/^\/files\/([0-9a-f-]+)\.png$/);
+  const file = url.pathname.match(/^\/files\/([0-9a-f-]+)\.(png|pdf)$/);
   if (req.method === 'GET' && file) {
     const f = files.get(file[1]);
-    if (!f) return res.writeHead(404).end();
-    return res.writeHead(200, { 'Content-Type': 'image/png' }).end(f.data);
+    if (!f || f.ext !== file[2]) return res.writeHead(404).end();
+    return res.writeHead(200, { 'Content-Type': FILE_TYPES[f.ext] }).end(f.data);
   }
 
   const route = routes[`${req.method} ${url.pathname}`];

@@ -1,4 +1,4 @@
-// Print-on-demand mode. Open the app with ?provider=printful or
+// Print-on-demand mode. Open the demo with ?provider=printful or
 // ?provider=printify and the shop's print step talks to that provider for real
 // through the backend in ../server, which holds the API tokens:
 //
@@ -9,8 +9,10 @@
 // customizer with PDF / PNG downloads.
 
 const PROVIDERS = {
-  printful: { id: 'printful', name: 'Printful' },
-  printify: { id: 'printify', name: 'Printify' },
+  printful: { id: 'printful', name: 'Printful', send: 'mockups' },
+  printify: { id: 'printify', name: 'Printify', send: 'mockups' },
+  // Teemill turns the front design into a buyable product page.
+  teemill: { id: 'teemill', name: 'Teemill', send: 'product' },
 };
 
 export const PROVIDER =
@@ -29,9 +31,12 @@ async function call(path, options) {
 export const fetchPrintArea = (colorId) =>
   call(`/${PROVIDER.id}/print-area?color=${encodeURIComponent(colorId)}`);
 
-/** Send the exported sides; returns { mockups: [{ side, url }], requests }. */
+/**
+ * Send the exported sides; returns { mockups: [{ side, url }], requests } and,
+ * for Teemill, the productUrl of the page it created.
+ */
 export const sendDesign = (files, colorId) =>
-  call(`/${PROVIDER.id}/mockups`, {
+  call(`/${PROVIDER.id}/${PROVIDER.send}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ color: colorId, files }),

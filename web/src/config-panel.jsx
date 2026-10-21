@@ -133,7 +133,7 @@ export function ConfigPanel({ view, onView, color, onColor, onExport, printArea,
               printArea?.areas?.[view]
                 ? [
                     `${printArea.areas[view].width} × ${printArea.areas[view].height} px`,
-                    `from ${PROVIDER.name}'s catalog`,
+                    printArea.fromCatalog === false ? 'export size' : `from ${PROVIDER.name}'s catalog`,
                   ]
                 : [`Width ${PRINT_MM_W}mm`, `Height ${PRINT_MM_H}mm`]
             }

@@ -1,6 +1,7 @@
 import React from 'react';
 import {
   Button,
+  buttonVariants,
   Spinner,
   Dialog,
   DialogContent,
@@ -73,10 +74,23 @@ const Result = ({ result, onClose }) => (
       <DialogHeader>
         <DialogTitle>Back from {PROVIDER.name}</DialogTitle>
         <DialogDescription>
-          These mockups were rendered by {PROVIDER.name} from the print files this
-          editor just exported, through its API. Nothing was ordered.
+          {result.productUrl
+            ? `${PROVIDER.name} created this product from the front design this editor just exported, through its API. Nothing was ordered.`
+            : `These mockups were rendered by ${PROVIDER.name} from the print files this editor just exported, through its API. Nothing was ordered.`}
         </DialogDescription>
       </DialogHeader>
+
+      {result.productUrl && (
+        <a
+          href={result.productUrl}
+          target="_blank"
+          rel="noreferrer"
+          className={buttonVariants({ variant: 'default' })}
+          style={{ marginTop: 4, alignSelf: 'flex-start' }}
+        >
+          Open the product page on {PROVIDER.name} ↗
+        </a>
+      )}
 
       <div style={styles.mockups}>
         {result.mockups.map((m) => (
@@ -112,9 +126,11 @@ export function ProviderSend({ color, printArea, onExport }) {
       const files = await onExport(printArea.areas);
       // Printful's mockup generator is a queue; Printify answers in seconds.
       setStep(
-        PROVIDER.id === 'printful'
-          ? 'Printful is rendering mockups. This takes 10–20 seconds…'
-          : 'Printify is rendering mockups…'
+        {
+          printful: 'Printful is rendering mockups. This takes 10–20 seconds…',
+          printify: 'Printify is rendering mockups…',
+          teemill: 'Teemill is creating the product…',
+        }[PROVIDER.id]
       );
       setResult(await sendDesign(files, color.id));
     } catch (e) {
@@ -146,8 +162,9 @@ export function ProviderSend({ color, printArea, onExport }) {
         <div style={styles.error}>{error}</div>
       ) : (
         <div style={styles.hint}>
-          Exports the artwork at {PROVIDER.name}&apos;s print size and gets {PROVIDER.name}
-          &apos;s own mockups back. Nothing is ordered.
+          {PROVIDER.send === 'product'
+            ? `Exports the front design and gets back a real ${PROVIDER.name} product page for it. Nothing is ordered.`
+            : `Exports the artwork at ${PROVIDER.name}'s print size and gets ${PROVIDER.name}'s own mockups back. Nothing is ordered.`}
         </div>
       )}
       {result && <Result result={result} onClose={() => setResult(null)} />}
