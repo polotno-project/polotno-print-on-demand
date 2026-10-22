@@ -18,6 +18,14 @@
 //   GET  /fourthwall/print-area real print areas of the demo tee
 //   POST /fourthwall/mockups    create a hidden design product in the shop,
 //                               return Fourthwall's mockups, then delete it
+//   GET  /spreadconnect/print-area real print areas of the demo tee
+//   POST /spreadconnect/mockups upload each side and get Spreadconnect's
+//                               product previews (read-only, nothing created
+//                               but the uploaded design files)
+//   GET  /peecho/product        the demo art print from Peecho's catalog
+//   POST /peecho/order          create a test order for the print PDF in
+//                               Peecho's test environment (never paid, so
+//                               never printed)
 //
 // Nothing is ordered. Mockups are free on Printful, and the Printify draft is
 // deleted as soon as its mockups are read.
@@ -28,6 +36,8 @@
 //   LULU_CLIENT_KEY, LULU_CLIENT_SECRET, LULU_API (defaults to the sandbox)
 //   TEEMILL_PUBLIC_KEY
 //   FOURTHWALL_USERNAME, FOURTHWALL_PASSWORD (shop API credentials)
+//   PEECHO_API_KEY (test environment), PEECHO_API (defaults to test)
+//   SPREADCONNECT_LIVE_API_KEY (previews only render on the live image server)
 //   PUBLIC_URL     this server's public URL; Printful downloads files from it
 //   ALLOWED_ORIGINS comma-separated, defaults to polotno.com and localhost
 
@@ -79,13 +89,15 @@ function cached(fn, ttlMs = 60 * 60 * 1000) {
 }
 
 async function api(base, token, path, { method = 'GET', body, headers = {} } = {}) {
+  // A provider with its own auth header passes Authorization: undefined.
+  const allHeaders = Object.fromEntries(
+    Object.entries({ Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', ...headers }).filter(
+      ([, v]) => v !== undefined
+    )
+  );
   const res = await fetch(base + path, {
     method,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-      ...headers,
-    },
+    headers: allHeaders,
     body: body ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
@@ -613,6 +625,167 @@ async function fourthwallMockups(body) {
   }
 }
 
+// --- Spreadconnect ----------------------------------------------------------------
+
+const SC_API = 'https://api.spreadconnect.app';
+// Men's Premium T-Shirt. Spreadconnect previews only work on its hotspots.
+const SC_PRODUCT = Number(env.SPREADCONNECT_PRODUCT_TYPE || 812);
+const SC_COLORS = { black: '2', blue: '317', red: '366' };
+const SC_HOTSPOTS = { front: 'FULL_FRONT', back: 'FULL_BACK' };
+// Exported at 150 DPI; Spreadconnect takes PNG under 10 MB.
+const SC_DPI = 150;
+
+function scKey() {
+  if (!env.SPREADCONNECT_LIVE_API_KEY) throw new HttpError(503, 'SPREADCONNECT_LIVE_API_KEY is not set');
+  return env.SPREADCONNECT_LIVE_API_KEY;
+}
+const spreadconnect = (path, opts = {}) =>
+  api(SC_API, '', path, { ...opts, headers: { Authorization: undefined, 'X-SPOD-ACCESS-TOKEN': scKey(), ...opts.headers } });
+
+const scProduct = cached(() => spreadconnect(`/productTypes/${SC_PRODUCT}`));
+
+async function spreadconnectPrintArea() {
+  const product = await scProduct('product');
+  const areas = {};
+  for (const [side, view] of [['front', 'FRONT'], ['back', 'BACK']]) {
+    const a = product.printAreas.find((p) => p.view === view);
+    if (a) areas[side] = { width: Math.round(a.widthInch * SC_DPI), height: Math.round(a.heightInch * SC_DPI), dpi: SC_DPI };
+  }
+  return { product: product.customerName?.trim(), areas, request: `GET ${SC_API}/productTypes/${SC_PRODUCT}` };
+}
+
+async function spreadconnectMockups(body) {
+  const sides = readSides(body);
+  const appearanceId = SC_COLORS[body.color] || '2';
+  const configurations = [];
+  for (const [side, base64] of Object.entries(sides)) {
+    const form = new FormData();
+    form.append('file', new Blob([Buffer.from(base64, 'base64')], { type: 'image/png' }), `polotno-demo-${side}.png`);
+    const res = await fetch(`${SC_API}/designs/upload`, { method: 'POST', headers: { 'X-SPOD-ACCESS-TOKEN': scKey() }, body: form });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || !json.designId) throw new HttpError(502, `Spreadconnect upload failed (${res.status})`);
+    configurations.push({ designId: json.designId, hotspot: SC_HOTSPOTS[side] });
+  }
+  const previewBody = { appearanceId, width: 600, height: 600, configurations };
+  const preview = await spreadconnect(`/productTypes/${SC_PRODUCT}/previews`, { method: 'POST', body: previewBody });
+  const wanted = configurations.map((c) => (c.hotspot === 'FULL_BACK' ? 'BACK' : 'FRONT'));
+  const mockups = (preview.images || [])
+    .filter((img) => wanted.includes(img.viewName))
+    .map((img) => ({ side: img.viewName.toLowerCase(), url: img.url }));
+  return {
+    mockups,
+    requests: [
+      { title: 'Upload each side', endpoint: `POST ${SC_API}/designs/upload`, body: { file: '<PNG, under 10 MB>' } },
+      { title: 'Get product previews', endpoint: `POST ${SC_API}/productTypes/${SC_PRODUCT}/previews`, body: previewBody },
+    ],
+  };
+}
+
+// --- Peecho -----------------------------------------------------------------------
+
+const PEECHO_API = (env.PEECHO_API || 'https://test.www.peecho.com/rest/v3').replace(/\/$/, '');
+// Fine Art Print A3, 297 × 420 mm: a one-page product, so one PDF page.
+const PEECHO_OFFERING = Number(env.PEECHO_OFFERING_ID || 1318687);
+
+function peechoKey() {
+  if (!env.PEECHO_API_KEY) throw new HttpError(503, 'PEECHO_API_KEY is not set');
+  return env.PEECHO_API_KEY;
+}
+
+async function peechoJson(path, opts) {
+  const res = await fetch(PEECHO_API + path, opts);
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  if (!res.ok) {
+    throw new HttpError(502, `Peecho ${path.split('?')[0]} failed (${res.status}): ${json.message || json.error || text.slice(0, 200)}`);
+  }
+  return json;
+}
+
+const peechoProduct = cached(async () => {
+  const list = await peechoJson(`/offering/list?merchantApiKey=${encodeURIComponent(peechoKey())}&categoryFilter=WA`);
+  for (const subs of Object.values(list)) {
+    for (const items of Object.values(subs)) {
+      const item = items.find((i) => i.id === PEECHO_OFFERING);
+      if (item) return item;
+    }
+  }
+  throw new HttpError(502, `Peecho offering ${PEECHO_OFFERING} is not active in this account`);
+});
+
+async function peechoProductInfo() {
+  const p = await peechoProduct('product');
+  return {
+    id: p.id,
+    name: p.name,
+    widthMm: p.dimensionWidth,
+    heightMm: p.dimensionHeight,
+    price: p.pricingDto,
+    request: `GET ${PEECHO_API}/offering/list`,
+  };
+}
+
+async function peechoOrder(body) {
+  const pdf = String(body?.pdf || '').replace(/^data:application\/pdf[^,]*,/, '');
+  if (!pdf.startsWith('JVBER')) throw new HttpError(400, 'pdf is not a PDF');
+  const product = await peechoProduct('product');
+
+  const orderBody = {
+    merchant_api_key: peechoKey(),
+    currency: 'EUR',
+    order_reference: `polotno-demo-${Date.now()}`,
+    // A list, although Peecho's docs describe a single object.
+    item_details: [{
+      title: 'Polotno demo print',
+      item_reference: 'polotno-demo-print', // required in practice, though the docs mark it optional
+      offering_id: product.id,
+      quantity: 1,
+      file_details: {
+        content_url: hostFile(pdf, 'pdf'),
+        content_width: product.dimensionWidth,
+        content_height: product.dimensionHeight,
+        number_of_pages: 1,
+      },
+    }],
+    address_details: {
+      email_address: 'demo@polotno.com',
+      shipping_address: {
+        first_name: 'Polotno',
+        last_name: 'Demo',
+        address_line_1: 'Keizersgracht 1',
+        address_line_2: '-',
+        zip_code: '1015 CJ',
+        city: 'Amsterdam',
+        country_code: 'NL',
+      },
+    },
+  };
+  const order = await peechoJson('/order/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(orderBody),
+  });
+  const orderId = order.order_id ?? order.orderId ?? order.id;
+  const details = orderId
+    ? await peechoJson(`/order/details?merchantApiKey=${encodeURIComponent(peechoKey())}&orderId=${orderId}`).catch(() => null)
+    : null;
+
+  return {
+    product: { name: product.name, widthMm: product.dimensionWidth, heightMm: product.dimensionHeight },
+    order,
+    details,
+    requests: [
+      {
+        title: 'Create the order with the print PDF',
+        endpoint: `POST ${PEECHO_API}/order/`,
+        body: { ...orderBody, merchant_api_key: '<your merchant API key>' },
+        response: order,
+      },
+    ],
+  };
+}
+
 // --- rate limit -----------------------------------------------------------------
 
 const hits = new Map();
@@ -637,6 +810,10 @@ const routes = {
   'POST /teemill/product': (body) => teemillProduct(body),
   'GET /fourthwall/print-area': () => fourthwallPrintArea(),
   'POST /fourthwall/mockups': (body) => fourthwallMockups(body),
+  'GET /spreadconnect/print-area': () => spreadconnectPrintArea(),
+  'POST /spreadconnect/mockups': (body) => spreadconnectMockups(body),
+  'GET /peecho/product': () => peechoProductInfo(),
+  'POST /peecho/order': (body) => peechoOrder(body),
 };
 
 function readBody(req) {

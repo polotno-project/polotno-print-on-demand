@@ -131,6 +131,7 @@ export function ProviderSend({ color, printArea, onExport }) {
           printify: 'Printify is rendering mockups…',
           teemill: 'Teemill is creating the product…',
           fourthwall: 'Fourthwall is rendering mockups…',
+          spreadconnect: 'Spreadconnect is rendering previews…',
         }[PROVIDER.id]
       );
       setResult(await sendDesign(files, color.id));

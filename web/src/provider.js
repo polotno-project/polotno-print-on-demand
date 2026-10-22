@@ -14,6 +14,7 @@ const PROVIDERS = {
   // Teemill turns the front design into a buyable product page.
   teemill: { id: 'teemill', name: 'Teemill', send: 'product' },
   fourthwall: { id: 'fourthwall', name: 'Fourthwall', send: 'mockups' },
+  spreadconnect: { id: 'spreadconnect', name: 'Spreadconnect', send: 'mockups' },
 };
 
 export const PROVIDER =
