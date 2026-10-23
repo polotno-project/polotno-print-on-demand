@@ -6,6 +6,8 @@ A t-shirt customizer built with [Polotno SDK](https://polotno.com). Customers de
 
 Try it live: [with Printful](https://polotno.com/sdk/product/integrations/printful) · [with Printify](https://polotno.com/sdk/product/integrations/printify) · [with Teemill](https://polotno.com/sdk/product/integrations/teemill) · [with Fourthwall](https://polotno.com/sdk/product/integrations/fourthwall) · [with Spreadconnect](https://polotno.com/sdk/product/integrations/spreadshirt)
 
+**One repo per provider:** [Printful](https://github.com/polotno-project/polotno-printful-demo) · [Printify](https://github.com/polotno-project/polotno-printify-demo) · [Teemill](https://github.com/polotno-project/polotno-teemill-demo) · [Fourthwall](https://github.com/polotno-project/polotno-fourthwall-demo) · [Spreadconnect](https://github.com/polotno-project/polotno-spreadconnect-demo) · [Scalable Press](https://github.com/polotno-project/polotno-scalable-press-demo) · [Lulu](https://github.com/polotno-project/polotno-lulu-demo) · [Peecho](https://github.com/polotno-project/polotno-peecho-demo) · [Gelato](https://github.com/polotno-project/polotno-gelato-demo) · [Prodigi](https://github.com/polotno-project/polotno-prodigi-demo). Each has only that provider's editor and backend. This repo keeps the five tee providers in one customizer.
+
 ## How it works
 
 1. The server reads the tee's print area from the provider's catalog, so the dashed box on the shirt matches the real print file.
