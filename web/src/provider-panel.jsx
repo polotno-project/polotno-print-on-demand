@@ -45,6 +45,16 @@ const styles = {
     border: '1px solid #e0e0e0',
   },
   caption: { fontSize: 12, color: '#525252', marginTop: 4, textTransform: 'capitalize' },
+  rendering: {
+    position: 'absolute',
+    inset: 0,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    fontSize: 12,
+    color: '#525252',
+  },
   label: { fontSize: 13, fontWeight: 600, marginTop: 20 },
   endpoint: { fontFamily: mono, fontSize: 12, margin: '6px 0' },
   code: {
@@ -67,6 +77,44 @@ const shorten = (value) =>
     (key, v) => (typeof v === 'string' && v.length > 120 ? `${v.slice(0, 40)}…` : v),
     2
   );
+
+// Some providers render on request: until the image is ready its URL answers
+// with an error, which can last a minute or more. Retry instead of showing an
+// empty box.
+const Mockup = ({ mockup }) => {
+  const [loaded, setLoaded] = React.useState(false);
+  const [attempt, setAttempt] = React.useState(0);
+  const gaveUp = attempt >= 40;
+  // A fragment is never sent to the server, so the URL stays the same while
+  // the browser treats each attempt as a new image.
+  const src = attempt ? `${mockup.url}#retry=${attempt}` : mockup.url;
+  return (
+    <div style={{ position: 'relative' }}>
+      <img
+        key={attempt}
+        src={src}
+        alt={`${PROVIDER.name} mockup, ${mockup.side}`}
+        style={styles.mockup}
+        onLoad={() => setLoaded(true)}
+        onError={() => !gaveUp && setTimeout(() => setAttempt((a) => a + 1), 3000)}
+      />
+      {!loaded && (
+        <div role="status" style={styles.rendering}>
+          {gaveUp ? (
+            <a href={mockup.url} target="_blank" rel="noreferrer">
+              Still rendering, open it later
+            </a>
+          ) : (
+            <>
+              <Spinner />
+              {PROVIDER.name} is rendering…
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
 
 const Result = ({ result, onClose }) => (
   <Dialog open onOpenChange={(open) => !open && onClose()}>
@@ -95,7 +143,7 @@ const Result = ({ result, onClose }) => (
       <div style={styles.mockups}>
         {result.mockups.map((m) => (
           <div key={m.url}>
-            <img src={m.url} alt={`${PROVIDER.name} mockup, ${m.side}`} style={styles.mockup} />
+            <Mockup mockup={m} />
             <div style={styles.caption}>{m.side}</div>
           </div>
         ))}
